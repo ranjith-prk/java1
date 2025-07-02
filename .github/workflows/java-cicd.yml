@@ -1,0 +1,167 @@
+name: Java CI Pipeline for multiple env as per repo
+
+on:
+  push:
+    branches: [main, dev, uat, prod, master]
+  pull_request:
+    branches: [main, dev, uat, prod, master]
+  workflow_dispatch:
+env:
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  API_TOKEN_GITHUB: ${{ secrets.GH_PAT_DEST_REPO1 }}
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+jobs:
+  check_changes:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout only microservice-one
+        uses: actions/checkout@v4
+        with:
+         repository: ashishrlad/simple-java-project
+         token: ${{ secrets.GITHUB_TOKEN }}
+         path: .
+         sparse-checkout: microservice-one/
+         sparse-checkout-cone-mode: true
+         fetch-depth: 1
+         ssh-strict: true
+         ssh-user: git
+         persist-credentials: true
+         clean: true
+         fetch-tags: false
+         show-progress: true
+         lfs: false
+         submodules: false
+         set-safe-directory: true
+
+     # SonarQube Scan
+      #- name: SonarQube Scan
+        #run: |
+          #mvn clean verify sonar:sonar \
+            #-Dsonar.projectKey=${{ vars.PROJECT_KEY }} \
+            #-Dsonar.projectName=${{ vars.PROJECT_NAME }} \
+            #-Dsonar.host.url=http://13.233.71.33:9000 \
+            #-Dsonar.token=${{ secrets.SONAR_TOKEN }}
+
+      # Build Java with Maven in container
+      - name: Build with Maven
+        run: |
+          cd microservice-one/
+          docker run --rm \
+            -v ${{ github.workspace }}:/app \
+            -w /app \
+            maven:3.9.4-eclipse-temurin-17 \
+            mvn clean package
+
+      # Docker Build
+      - name: Build Docker Image
+        run: |
+           IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+           docker build -t $IMAGE_NAME .
+
+      # Trivy Security Scan
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          output: 'trivy-report.txt'
+      
+      # Send Email Report
+      #- name: Email Trivy Report
+	      #uses: dawidd6/action-send-mail@v3
+        #with:
+          #server_address: smtp.gmail.com
+          #server_port: 587
+          #username: ${{ secrets.MAIL_USERNAME }}
+          #password: ${{ secrets.MAIL_PASSWORD }}
+          #subject: "Trivy Report - ${{ github.repository }} (${{ github.ref_name }})"
+          #body: "Attached Trivy scan report for image built from ${{ github.ref_name }}."
+          #to: ashishrlad@gmail.com
+          #from: ${{ secrets.MAIL_USERNAME }}
+          #attachments: trivy-report.txt
+      
+       # docker push image to dockerhub
+      - name: Docker Push to docker hub Repository'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker push ${IMAGE_NAME}
+  
+  deploy-dev:
+     if: github.ref == 'refs/heads/dev'
+     needs: check_changes
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+     environment: production   # This enforces manual approvala
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+            repository: ashishrlad/config_repo_samplejava
+            ref: ${{ github.ref_name }}  # Or explicitly like 'dev', 'uat', etc.
+            token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+            path: manifest-repo/microservice-one
+            persist-credentials: true
+
+       - name: Read current image from manifest
+         id: current_image
+         run: |
+            CURRENT_IMAGE=$(grep -E '^\s*[-]?\s*image:' manifest-repo/microservice-one/manifest-repo/microservice-one/dev/microservice-one-deployment.yml | awk -F'image: ' '{print $2}' | xargs)
+            pwd
+            echo "CURRENT_IMAGE=$CURRENT_IMAGE"
+            echo "CURRENT_IMAGE=$CURRENT_IMAGE" >> $GITHUB_ENV
+            echo "current_image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+       
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-one/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+       - name: Check health of google.com
+         id: health
+         continue-on-error: true
+         run: |
+          sleep 20
+          status=$(curl -s -o /dev/null -w "%{http_code}" https://www.googlertye.com)
+          echo "HTTP status: $status"
+          echo "status=$status" >> $GITHUB_OUTPUT
+
+       - name: Rollback Image Tag
+         if: steps.health.outputs.status != '200'
+         run: |
+            cd manifest-repo/microservice-one/manifest-repo/
+            git checkout ${{ github.ref_name }}
+            sed -i "s|image:.*|image: ${CURRENT_IMAGE}|" microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+
+       - name: Push Rollback Image Tag
+         if: steps.health.outputs.status != '200'
+         run: |
+             cd manifest-repo/microservice-one/manifest-repo/
+             git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+             git checkout ${{ github.ref_name }}
+             git add .
+             git commit -m "Rollback: Reverted image tag to ${CURRENT_IMAGE} due to failed health check"
+             git push origin ${{ github.ref_name }} --force
