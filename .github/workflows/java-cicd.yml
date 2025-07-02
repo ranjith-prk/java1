@@ -1,0 +1,506 @@
+name: Java CI Pipeline multiple java service per repo
+
+on:
+  push:
+    branches: [main, dev, uat, prod]
+    paths:
+      - '**/microservice-one/**'
+      - '**/microservice-two/**'
+  pull_request:
+    branches: [main, dev, uat, prod]
+    paths:
+      - '**/microservice-one/**'
+      - '**/microservice-two/**' 
+  workflow_dispatch:
+
+env:
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  API_TOKEN_GITHUB: ${{ secrets.GH_PAT_DEST_REPO1 }}
+jobs:
+  check_changes:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
+    outputs:
+      microservice_one_changed: ${{ steps.detect.outputs.microservice_one_changed }}
+      microservice_two_changed: ${{ steps.detect.outputs.microservice_two_changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect folder changes
+        id: detect
+        run: |
+          echo "Checking for changes in microservices..."
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          if echo "$CHANGED_FILES" | grep -q '^microservice-one/'; then
+            echo "microservice_one_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "microservice_one_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED_FILES" | grep -q '^microservice-two/'; then
+            echo "microservice_two_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "microservice_two_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  microservice-one-job-ci:
+    needs: check_changes
+    if: needs.check_changes.outputs.microservice_one_changed == 'true'
+    runs-on: ubuntu-latest
+    env:
+       IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+    steps:
+      - name: Checkout only microservice-one
+        uses: actions/checkout@v4
+        with:
+         repository: ashishrlad/simple-java-project
+         token: ${{ secrets.GITHUB_TOKEN }}
+         path: .
+         sparse-checkout: microservice-one/
+         sparse-checkout-cone-mode: true
+         fetch-depth: 1
+         ssh-strict: true
+         ssh-user: git
+         persist-credentials: true
+         clean: true
+         fetch-tags: false
+         show-progress: true
+         lfs: false
+         submodules: false
+         set-safe-directory: true
+
+     # SonarQube Scan
+      #- name: SonarQube Scan
+        #run: |
+          #mvn clean verify sonar:sonar \
+            #-Dsonar.projectKey=${{ vars.PROJECT_KEY }} \
+            #-Dsonar.projectName=${{ vars.PROJECT_NAME }} \
+            #-Dsonar.host.url=http://13.233.71.33:9000 \
+            #-Dsonar.token=${{ secrets.SONAR_TOKEN }}
+
+      # Build Java with Maven in container
+      - name: Build with Maven
+        run: |
+          cd microservice-one/
+          docker run --rm \
+            -v ${{ github.workspace }}:/app \
+            -w /app \
+            maven:3.9.4-eclipse-temurin-17 \
+            mvn clean package
+
+      # Docker Build
+      - name: Build Docker Image
+        run: |
+           IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+           docker build -t $IMAGE_NAME .
+
+      # Trivy Security Scan
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          output: 'trivy-report.txt'
+      
+      # Send Email Report
+      #- name: Email Trivy Report
+	      #uses: dawidd6/action-send-mail@v3
+        #with:
+          #server_address: smtp.gmail.com
+          #server_port: 587
+          #username: ${{ secrets.MAIL_USERNAME }}
+          #password: ${{ secrets.MAIL_PASSWORD }}
+          #subject: "Trivy Report - ${{ github.repository }} (${{ github.ref_name }})"
+          #body: "Attached Trivy scan report for image built from ${{ github.ref_name }}."
+          #to: ashishrlad@gmail.com
+          #from: ${{ secrets.MAIL_USERNAME }}
+          #attachments: trivy-report.txt
+      
+       # docker push image to dockerhub
+      - name: Docker Push to docker hub Repository'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker push ${IMAGE_NAME}
+  
+  deploy-MS1-main:
+     if: github.ref == 'refs/heads/main'
+     needs: microservice-one-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+     environment: production   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-one
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-one/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  deploy-MS1-prod:
+     if: github.ref == 'refs/heads/prod'
+     needs: microservice-one-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+     environment: prod   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-one
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-one/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  deploy-MS1-uat:
+     if: github.ref == 'refs/heads/uat'
+     needs: microservice-one-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+     environment: uat   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-one
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-one/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force 
+
+  deploy-MS1-dev:
+     if: github.ref == 'refs/heads/dev'
+     needs: microservice-one-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-one:${{ github.ref_name }}-${{ github.run_id }}
+     environment: dev   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-one
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+            cat manifest-repo/microservice-one/manifest-repo/microservice-one/${{ github.ref_name }}/microservice-one-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-one/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  microservice-two-job-ci:
+    needs: check_changes
+    if: needs.check_changes.outputs.microservice_two_changed == 'true'
+    runs-on: ubuntu-latest
+    env:
+       IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+    steps:
+      - name: Checkout only microservice-two
+        uses: actions/checkout@v4
+        with:
+         repository: ashishrlad/simple-java-project
+         token: ${{ secrets.GITHUB_TOKEN }}
+         path: .
+         sparse-checkout: microservice-two/
+         sparse-checkout-cone-mode: true
+         fetch-depth: 1
+         ssh-strict: true
+         ssh-user: git
+         persist-credentials: true
+         clean: true
+         fetch-tags: false
+         show-progress: true
+         lfs: false
+         submodules: false
+         set-safe-directory: true
+
+     # SonarQube Scan
+      #- name: SonarQube Scan
+        #run: |
+          #mvn clean verify sonar:sonar \
+            #-Dsonar.projectKey=${{ vars.PROJECT_KEY }} \
+            #-Dsonar.projectName=${{ vars.PROJECT_NAME }} \
+            #-Dsonar.host.url=http://13.233.71.33:9000 \
+            #-Dsonar.token=${{ secrets.SONAR_TOKEN }}
+
+      # Build Java with Maven in container
+      - name: Build with Maven
+        run: |
+          cd microservice-two/
+          docker run --rm \
+            -v ${{ github.workspace }}:/app \
+            -w /app \
+            maven:3.9.4-eclipse-temurin-17 \
+            mvn clean package
+
+      # Docker Build
+      - name: Build Docker Image
+        run: |
+           IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+           echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+           docker build -t $IMAGE_NAME .
+
+      # Trivy Security Scan
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          output: 'trivy-report.txt'
+      
+      # Send Email Report
+      #- name: Email Trivy Report
+	      #uses: dawidd6/action-send-mail@v3
+        #with:
+          #server_address: smtp.gmail.com
+          #server_port: 587
+          #username: ${{ secrets.MAIL_USERNAME }}
+          #password: ${{ secrets.MAIL_PASSWORD }}
+          #subject: "Trivy Report - ${{ github.repository }} (${{ github.ref_name }})"
+          #body: "Attached Trivy scan report for image built from ${{ github.ref_name }}."
+          #to: ashishrlad@gmail.com
+          #from: ${{ secrets.MAIL_USERNAME }}
+          #attachments: trivy-report.txt
+      
+       # docker push image to dockerhub
+      - name: Docker Push to docker hub Repository'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker push ${IMAGE_NAME}
+  
+  deploy-MS2-main:
+     if: github.ref == 'refs/heads/main'
+     needs: microservice-two-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+     environment: main   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-two
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+            cat manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-two/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  deploy-MS2-prod:
+     if: github.ref == 'refs/heads/prod'
+     needs: microservice-two-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+     environment: prod   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-two
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+            cat manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-two/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  deploy-MS2-uat:
+     if: github.ref == 'refs/heads/uat'
+     needs: microservice-two-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+     environment: uat   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-two
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+            cat manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-two/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
+
+  deploy-MS2-dev:
+     if: github.ref == 'refs/heads/dev'
+     needs: microservice-two-job-ci
+     runs-on: ubuntu-latest
+     env:
+      CHANGED_FOLDER: ${{ needs.check_changes.outputs.changed_folder }}
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/microservice-two:${{ github.ref_name }}-${{ github.run_id }}
+     environment: dev   # This enforces manual approval
+     steps:
+       - name: Docker pull
+         run: |
+           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+           docker pull $IMAGE_NAME 
+       - name: Checkout menifeast repository
+         uses: actions/checkout@v4
+         with:
+             repository: ashishrlad/config_repo_samplejava
+             token: ${{ secrets.GH_PAT_DEST_REPO1 }}
+             path: manifest-repo/microservice-two
+             persist-credentials: true
+       - name: "Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+            git config --global user.name "ashishrlad"
+            git config --global user.email "ashishrlad@gmail.com"
+            sed -i "s|image:.*|image: ${IMAGE_NAME}|"  manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+            cat manifest-repo/microservice-two/manifest-repo/microservice-two/${{ github.ref_name }}/microservice-two-deployment.yml
+       - name: "Push Updated Image Tag for ${{ github.ref_name }} git branch" 
+         run: |
+           cd manifest-repo/microservice-two/manifest-repo/
+           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT_DEST_REPO1 }}@github.com/ashishrlad/config_repo_samplejava.git
+           git checkout ${{ github.ref_name }} || git checkout -b ${{ github.ref_name }}
+           git config --global init.defaultBranch ${{ github.ref_name }}
+           git add . 
+           git commit -m "Updated image tag in ${{ github.ref_name }} manifeastfile"
+           git push origin ${{ github.ref_name }} --force
