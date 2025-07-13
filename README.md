@@ -1,2 +1,7 @@
 # Simple Java Project
-This is a demo project that you can use with [Buddy Continuous Deployment](https://buddy.works).
+
+This is a demo project
+
+My first commit - MY Name
+
+RAJOLI JAGADEESWAR REDDY
