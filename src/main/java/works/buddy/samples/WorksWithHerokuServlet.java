@@ -1,4 +1,3 @@
-# java servelet 
 package works.buddy.samples;
 
 import javax.servlet.ServletException;
